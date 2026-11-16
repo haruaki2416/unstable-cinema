@@ -93,7 +93,20 @@ srtInput.addEventListener('change',async()=>{
  try{const text=await file.text();cues=parseSrt(text);activeSubtitleName=file.name;updateCaption();setStatus(cues.length+' subtitle cues loaded from '+file.name+'.');}
  catch(e){cues=[];caption.hidden=true;setStatus('Could not read that subtitle file. Please choose the .srt again.');}
 });
-video.addEventListener('timeupdate',updateCaption);video.addEventListener('seeked',updateCaption);
+let subtitleRaf=0;
+function syncSubtitleFrames(){
+ updateCaption();
+ if(video.paused||video.ended)return;
+ if(typeof video.requestVideoFrameCallback==='function'){
+  video.requestVideoFrameCallback(syncSubtitleFrames);
+ }else{
+  subtitleRaf=requestAnimationFrame(syncSubtitleFrames);
+ }
+}
+video.addEventListener('play',syncSubtitleFrames);
+video.addEventListener('pause',()=>{updateCaption();if(subtitleRaf)cancelAnimationFrame(subtitleRaf)});
+video.addEventListener('timeupdate',updateCaption);
+video.addEventListener('seeked',updateCaption);
 video.addEventListener('loadedmetadata',()=>{empty.hidden=true;setStatus('Video ready'+(cues.length?' • subtitles synced':' • choose your SRT file')+'.')});
 video.addEventListener('error',()=>setStatus('This video format may not be supported by Safari. Try an MP4 encoded with H.264 video and AAC audio.'));
 document.getElementById('size').addEventListener('change',e=>caption.style.fontSize=e.target.value+'px');
