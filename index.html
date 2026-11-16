@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#090b12">
+<title>Unstable Cinema</title>
+<style>
+:root{color-scheme:dark;--bg:#090b12;--panel:#121622;--line:#252c3c;--muted:#929bad;--text:#f4f6fb;--accent:#9b8cff}
+*{box-sizing:border-box}
+body{margin:0;background:radial-gradient(ellipse at 50% -20%,#252044 0,transparent 55%),var(--bg);color:var(--text);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh}
+main{width:min(100% - 28px,980px);margin:0 auto;padding:34px 0 50px}
+header{display:flex;align-items:center;gap:13px;margin-bottom:27px}
+.logo{width:43px;height:43px;border-radius:14px;background:linear-gradient(145deg,#b2a4ff,#6555c9);display:grid;place-items:center;color:#0b0b14;font-size:21px;font-weight:900;box-shadow:0 8px 30px #7865e344}
+h1{font-size:21px;letter-spacing:-.5px;margin:0}
+.subhead{color:var(--muted);font-size:13px;margin-top:2px}
+.panel{background:color-mix(in srgb,var(--panel) 94%,transparent);border:1px solid var(--line);border-radius:20px;padding:18px;box-shadow:0 18px 60px #0003}
+.pickers{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}
+.pick{display:flex;flex-direction:column;gap:8px;padding:15px;border:1px dashed #414960;border-radius:14px;background:#ffffff04;min-width:0}
+.pick strong{font-size:14px}
+.pick small{color:var(--muted);font-size:12px}
+input[type=file]{width:100%;font-size:12px;color:var(--muted)}
+input::file-selector-button{border:0;border-radius:8px;padding:9px 11px;background:#292e40;color:var(--text);font-weight:650;margin-right:8px}
+.stage{position:relative;background:#000;border-radius:15px;overflow:hidden;aspect-ratio:16/9;display:grid;place-items:center}
+video{width:100%;height:100%;object-fit:contain;background:#000}
+.empty{position:absolute;inset:0;display:grid;place-content:center;text-align:center;padding:20px;pointer-events:none}
+.empty .glyph{font-size:35px;margin-bottom:8px}
+.empty strong{font-size:15px}
+.empty span{font-size:12px;color:#a6adbd;margin-top:4px}
+.caption{position:absolute;left:5%;right:5%;bottom:7%;text-align:center;white-space:pre-line;font-weight:700;line-height:1.35;color:white;font-size:25px;letter-spacing:.1px;text-shadow:0 2px 3px #000,2px 0 3px #000,-2px 0 3px #000,0 -2px 3px #000,0 4px 12px #000;background:#00000038;border-radius:8px;padding:3px 8px;pointer-events:none}
+.controls{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding-top:15px}
+.status{color:var(--muted);font-size:12px;min-height:18px}
+.tools{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+button,select{border:1px solid var(--line);border-radius:10px;background:#1b2030;color:var(--text);padding:9px 12px;font:inherit;font-size:13px}
+button:active{transform:scale(.98)}
+button:disabled{opacity:.4}
+.setting{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:12px}
+select{padding:8px 9px}
+.note{color:var(--muted);font-size:12px;margin:15px 2px 0}
+.note b{color:#c9c2ff}
+@media(max-width:600px){main{width:min(100% - 20px,980px);padding-top:22px}.pickers{grid-template-columns:1fr}.panel{padding:12px}.caption{font-size:20px}.stage{aspect-ratio:16/10}}
+:fullscreen .stage{border-radius:0;aspect-ratio:auto;height:100vh}
+:fullscreen video{height:100vh}
+</style>
+</head>
+<body>
+<main>
+<header><div class="logo">▶</div><div><h1>Unstable Cinema</h1><div class="subhead">Your video. Your subtitles. All local.</div></div></header>
+<section class="panel" id="player">
+<div class="pickers">
+<label class="pick"><strong>🎬 Choose your movie</strong><small>Select the downloaded video from Files</small><input id="videoFile" type="file" accept="video/*"></label>
+<label class="pick"><strong>💬 Choose subtitles</strong><small>Select your synced .srt file</small><input id="subtitleFile" type="file" accept=".srt,application/x-subrip,text/plain"></label>
+</div>
+<div class="stage" id="stage">
+<video id="video" controls playsinline preload="metadata"></video>
+<div class="empty" id="empty"><div class="glyph">🎞️</div><strong>Your cinema is ready</strong><span>Choose a video and an SRT file above</span></div>
+<div class="caption" id="caption" hidden></div>
+</div>
+<div class="controls">
+<div class="status" id="status" aria-live="polite">Waiting for your files…</div>
+<div class="tools">
+<label class="setting">Text size <select id="size"><option value="18">Small</option><option value="25" selected>Medium</option><option value="32">Large</option><option value="40">Huge</option></select></label>
+<label class="setting">Speed <select id="speed"><option value=".5">0.5×</option><option value=".75">0.75×</option><option value="1" selected>1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="1.75">1.75×</option><option value="2">2×</option></select></label>
+<button id="fullscreen" type="button">⛶ Fullscreen</button>
+</div>
+</div>
+<p class="note"><b>Privacy:</b> Files are opened directly in your browser. Your movie and subtitles are not uploaded anywhere.</p>
+</section>
+</main>
+<script>
+const video=document.getElementById('video'), videoInput=document.getElementById('videoFile'), srtInput=document.getElementById('subtitleFile'), caption=document.getElementById('caption'), statusEl=document.getElementById('status'), empty=document.getElementById('empty'), stage=document.getElementById('stage');
+let cues=[],videoUrl=null,activeSubtitleName='';
+function setStatus(s){statusEl.textContent=s}
+function parseTime(t){const m=t.trim().match(/^(\d{2}):(\d{2}):(\d{2})[,.](\d{3})$/);return m?Number(m[1])*3600+Number(m[2])*60+Number(m[3])+Number(m[4])/1000:NaN}
+function parseSrt(text){
+ const normalized=text.replace(/^\uFEFF/,'').replace(/\r/g,'').trim();
+ const blocks=normalized.split(/\n\s*\n/);const parsed=[];
+ for(const block of blocks){const lines=block.split('\n');const ti=lines.findIndex(x=>x.includes('-->'));if(ti<0)continue;const parts=lines[ti].split('-->');const start=parseTime(parts[0]);const end=parseTime(parts[1].trim().split(/\s+/)[0]);const body=lines.slice(ti+1).join('\n').trim();if(Number.isFinite(start)&&Number.isFinite(end)&&body)parsed.push({start,end,text:body.replace(/<[^>]*>/g,'')});}
+ return parsed.sort((a,b)=>a.start-b.start);
+}
+function updateCaption(){
+ const t=video.currentTime;let lo=0,hi=cues.length-1,found=null;
+ while(lo<=hi){const mid=(lo+hi)>>1,c=cues[mid];if(t<c.start)hi=mid-1;else if(t>c.end)lo=mid+1;else{found=c;break}}
+ if(found){caption.textContent=found.text;caption.hidden=false}else{caption.hidden=true}
+}
+videoInput.addEventListener('change',()=>{
+ const file=videoInput.files&&videoInput.files[0];if(!file)return;
+ if(videoUrl)URL.revokeObjectURL(videoUrl);videoUrl=URL.createObjectURL(file);video.src=videoUrl;video.load();empty.hidden=true;
+ setStatus('Loaded video: '+file.name+' — choose subtitles if you haven’t yet.');
+});
+srtInput.addEventListener('change',async()=>{
+ const file=srtInput.files&&srtInput.files[0];if(!file)return;
+ try{const text=await file.text();cues=parseSrt(text);activeSubtitleName=file.name;updateCaption();setStatus(cues.length+' subtitle cues loaded from '+file.name+'.');}
+ catch(e){cues=[];caption.hidden=true;setStatus('Could not read that subtitle file. Please choose the .srt again.');}
+});
+video.addEventListener('timeupdate',updateCaption);video.addEventListener('seeked',updateCaption);
+video.addEventListener('loadedmetadata',()=>{empty.hidden=true;setStatus('Video ready'+(cues.length?' • subtitles synced':' • choose your SRT file')+'.')});
+video.addEventListener('error',()=>setStatus('This video format may not be supported by Safari. Try an MP4 encoded with H.264 video and AAC audio.'));
+document.getElementById('size').addEventListener('change',e=>caption.style.fontSize=e.target.value+'px');
+document.getElementById('speed').addEventListener('change',e=>video.playbackRate=Number(e.target.value));
+document.getElementById('fullscreen').addEventListener('click',async()=>{
+ try{if(document.fullscreenElement){await document.exitFullscreen()}else if(stage.requestFullscreen){await stage.requestFullscreen()}else if(video.webkitEnterFullscreen){video.webkitEnterFullscreen()}else{setStatus('Fullscreen is not available in this browser.');}}
+ catch(e){if(video.webkitEnterFullscreen)video.webkitEnterFullscreen();else setStatus('Fullscreen could not be started.');}
+});
+document.addEventListener('fullscreenchange',()=>{document.getElementById('fullscreen').textContent=document.fullscreenElement?'⤢ Exit fullscreen':'⛶ Fullscreen'});
+</script>
+</body>
+</html>
