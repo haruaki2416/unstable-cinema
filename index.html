@@ -23,10 +23,6 @@ input[type=file]{width:100%;font-size:12px;color:var(--muted)}
 input::file-selector-button{border:0;border-radius:8px;padding:9px 11px;background:#292e40;color:var(--text);font-weight:650;margin-right:8px}
 .stage{position:relative;background:#000;border-radius:15px;overflow:hidden;aspect-ratio:16/9;display:grid;place-items:center}
 video{width:100%;height:100%;object-fit:contain;background:#000}
-.empty{position:absolute;inset:0;display:grid;place-content:center;text-align:center;padding:20px;pointer-events:none}
-.empty .glyph{font-size:35px;margin-bottom:8px}
-.empty strong{font-size:15px}
-.empty span{font-size:12px;color:#a6adbd;margin-top:4px}
 .caption{position:absolute;left:5%;right:5%;bottom:7%;text-align:center;white-space:pre-line;font-weight:700;line-height:1.35;color:white;font-size:25px;letter-spacing:.1px;text-shadow:0 2px 3px #000,2px 0 3px #000,-2px 0 3px #000,0 -2px 3px #000,0 4px 12px #000;background:#00000038;border-radius:8px;padding:3px 8px;pointer-events:none}
 .controls{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding-top:15px}
 .status{color:var(--muted);font-size:12px;min-height:18px}
@@ -49,11 +45,11 @@ select{padding:8px 9px}
 <section class="panel" id="player">
 <div class="pickers">
 <label class="pick"><strong>🎬 Choose your movie</strong><small>Select the downloaded video from Files</small><input id="videoFile" type="file" accept="video/*"></label>
-<label class="pick"><strong>💬 Choose subtitles</strong><small>Select your synced .srt file</small><input id="subtitleFile" type="file" accept=".srt,application/x-subrip,text/plain"></label>
+<label class="pick"><strong>💬 Choose subtitles</strong><small>Select your synced .srt file</small><input id="subtitleFile" type="file" accept=".srt,.txt,application/x-subrip,text/plain"></label>
 </div>
 <div class="stage" id="stage">
 <video id="video" controls playsinline preload="metadata"></video>
-<div class="empty" id="empty"><div class="glyph">🎞️</div><strong>Your cinema is ready</strong><span>Choose a video and an SRT file above</span></div>
+
 <div class="caption" id="caption" hidden></div>
 </div>
 <div class="controls">
@@ -68,7 +64,7 @@ select{padding:8px 9px}
 </section>
 </main>
 <script>
-const video=document.getElementById('video'), videoInput=document.getElementById('videoFile'), srtInput=document.getElementById('subtitleFile'), caption=document.getElementById('caption'), statusEl=document.getElementById('status'), empty=document.getElementById('empty'), stage=document.getElementById('stage');
+const video=document.getElementById('video'), videoInput=document.getElementById('videoFile'), srtInput=document.getElementById('subtitleFile'), caption=document.getElementById('caption'), statusEl=document.getElementById('status'), stage=document.getElementById('stage');
 let cues=[],videoUrl=null,activeSubtitleName='';
 function setStatus(s){statusEl.textContent=s}
 function parseTime(t){const m=t.trim().match(/^(\d{2}):(\d{2}):(\d{2})[,.](\d{3})$/);return m?Number(m[1])*3600+Number(m[2])*60+Number(m[3])+Number(m[4])/1000:NaN}
@@ -85,29 +81,26 @@ function updateCaption(){
 }
 videoInput.addEventListener('change',()=>{
  const file=videoInput.files&&videoInput.files[0];if(!file)return;
- if(videoUrl)URL.revokeObjectURL(videoUrl);videoUrl=URL.createObjectURL(file);video.src=videoUrl;video.load();empty.hidden=true;
- setStatus('Loaded video: '+file.name+' — choose subtitles if you haven’t yet.');
+ if(videoUrl)URL.revokeObjectURL(videoUrl);videoUrl=URL.createObjectURL(file);video.pause();video.removeAttribute('src');video.load();video.src=videoUrl;video.load();caption.hidden=true;
+ setStatus('Video selected: '+file.name+'. Press play when ready.');
 });
 srtInput.addEventListener('change',async()=>{
  const file=srtInput.files&&srtInput.files[0];if(!file)return;
- try{const text=await file.text();cues=parseSrt(text);activeSubtitleName=file.name;updateCaption();setStatus(cues.length+' subtitle cues loaded from '+file.name+'.');}
+ try{const text=await file.text();cues=parseSrt(text);activeSubtitleName=file.name;updateCaption();setStatus(cues.length+' subtitle cues loaded from '+file.name.replace(/\\.txt$/i,'')+'.');}
  catch(e){cues=[];caption.hidden=true;setStatus('Could not read that subtitle file. Please choose the .srt again.');}
 });
 let subtitleRaf=0;
 function syncSubtitleFrames(){
  updateCaption();
- if(video.paused||video.ended)return;
- if(typeof video.requestVideoFrameCallback==='function'){
-  video.requestVideoFrameCallback(syncSubtitleFrames);
- }else{
-  subtitleRaf=requestAnimationFrame(syncSubtitleFrames);
- }
+ if(video.paused||video.ended){subtitleRaf=0;return;}
+ subtitleRaf=requestAnimationFrame(syncSubtitleFrames);
 }
-video.addEventListener('play',syncSubtitleFrames);
-video.addEventListener('pause',()=>{updateCaption();if(subtitleRaf)cancelAnimationFrame(subtitleRaf)});
+video.addEventListener('play',()=>{if(!subtitleRaf)syncSubtitleFrames()});
+video.addEventListener('pause',()=>{updateCaption();if(subtitleRaf){cancelAnimationFrame(subtitleRaf);subtitleRaf=0}});
+video.addEventListener('ended',()=>{caption.hidden=true;if(subtitleRaf){cancelAnimationFrame(subtitleRaf);subtitleRaf=0}});
 video.addEventListener('timeupdate',updateCaption);
 video.addEventListener('seeked',updateCaption);
-video.addEventListener('loadedmetadata',()=>{empty.hidden=true;setStatus('Video ready'+(cues.length?' • subtitles synced':' • choose your SRT file')+'.')});
+video.addEventListener('loadedmetadata',()=>{setStatus('Video loaded • '+Math.round(video.duration/60)+' min'+(cues.length?' • subtitles loaded':' • choose your subtitle file')+'.')});
 video.addEventListener('error',()=>setStatus('This video format may not be supported by Safari. Try an MP4 encoded with H.264 video and AAC audio.'));
 document.getElementById('size').addEventListener('change',e=>caption.style.fontSize=e.target.value+'px');
 document.getElementById('speed').addEventListener('change',e=>video.playbackRate=Number(e.target.value));
