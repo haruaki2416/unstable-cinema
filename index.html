@@ -81,12 +81,14 @@ function installNativeSubtitles(){
  if(subtitleTrack){subtitleTrack.remove();subtitleTrack=null}
  if(subtitleUrl){URL.revokeObjectURL(subtitleUrl);subtitleUrl=null}
  if(!cues.length)return;
- const vtt='WEBVTT\\n\\n'+cues.map(c=>toVttTime(c.start)+' --> '+toVttTime(c.end)+'\\n'+c.text).join('\\n\\n');
+ const vtt='WEBVTT\n\n'+cues.map(c=>toVttTime(c.start)+' --> '+toVttTime(c.end)+'\n'+c.text).join('\n\n');
  subtitleUrl=URL.createObjectURL(new Blob([vtt],{type:'text/vtt'}));
  subtitleTrack=document.createElement('track');subtitleTrack.kind='subtitles';subtitleTrack.label='English';subtitleTrack.srclang='en';subtitleTrack.default=true;subtitleTrack.src=subtitleUrl;
  video.appendChild(subtitleTrack);
- subtitleTrack.addEventListener('load',()=>{if(video.textTracks.length)video.textTracks[video.textTracks.length-1].mode='showing'});
- if(video.textTracks.length)video.textTracks[video.textTracks.length-1].mode='showing';
+ const showTrack=()=>{try{subtitleTrack.track.mode='showing'}catch(e){}};
+ subtitleTrack.addEventListener('load',showTrack);
+ showTrack();
+ setTimeout(showTrack,250);
 }
 videoInput.addEventListener('change',()=>{
  const file=videoInput.files&&videoInput.files[0];if(!file)return;
@@ -95,7 +97,7 @@ videoInput.addEventListener('change',()=>{
 });
 srtInput.addEventListener('change',async()=>{
  const file=srtInput.files&&srtInput.files[0];if(!file)return;
- try{const text=await file.text();cues=parseSrt(text);activeSubtitleName=file.name;installNativeSubtitles();setStatus(cues.length+' subtitle cues loaded from '+file.name.replace(/\\.txt$/i,'')+'.');}
+ try{const text=await file.text();cues=parseSrt(text);activeSubtitleName=file.name;installNativeSubtitles();setStatus(cues.length+' subtitle cues loaded from '+file.name.replace(/\.txt$/i,'')+'.');}
  catch(e){cues=[];installNativeSubtitles();setStatus('Could not read that subtitle file. Please choose the .srt again.');}
 });
 video.addEventListener('loadedmetadata',()=>{setStatus('Video loaded • '+Math.round(video.duration/60)+' min'+(cues.length?' • subtitles loaded':' • choose your subtitle file')+'.')});
