@@ -156,7 +156,7 @@ def part_url(token: str, part_number: int, authorization: str | None = Header(de
     return {"url":url}
 @app.post("/api/upload/{token}/complete")
 def complete_upload(token: str, body: CompleteUpload, authorization: str | None = Header(default=None)):
-    item=load_upload(token)
+    check_auth(authorization); item=load_upload(token)
     if body.upload_id!=item["upload_id"] or body.key!=item["key"]: raise HTTPException(404,"Upload session mismatch.")
     try:
         listed=s3.list_parts(Bucket=BUCKET,Key=item["key"],UploadId=item["upload_id"])
