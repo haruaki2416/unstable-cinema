@@ -1,4 +1,4 @@
-import os, uuid, threading, tempfile, subprocess, secrets
+import os, uuid, threading, tempfile, subprocess, secrets, json
 from pathlib import Path
 from typing import Dict, Any
 import boto3
@@ -128,29 +128,54 @@ def init_upload(body: InitUpload, authorization: str | None = Header(default=Non
     if body.size <= 0 or body.size > 30*1024*1024*1024: raise HTTPException(400,"Video must be between 1 byte and 30 GB.")
     key=f"input/{uuid.uuid4()}-{Path(body.filename).name[:100]}"
     result=s3.create_multipart_upload(Bucket=BUCKET,Key=key,ContentType="video/mp4")
-    token=str(uuid.uuid4()); uploads[token]={"key":key,"upload_id":result["UploadId"],"size":body.size}
+    token=str(uuid.uuid4()); item={"key":key,"upload_id":result["UploadId"],"size":body.size,"filename":Path(body.filename).name}
+    uploads[token]=item
+    s3.put_object(Bucket=BUCKET,Key=f"sessions/{token}.json",Body=json.dumps(item).encode(),ContentType="application/json")
     return {"token":token,"key":key,"upload_id":result["UploadId"],"part_size":PART_SIZE}
+def load_upload(token: str):
+    try:
+        obj=s3.get_object(Bucket=BUCKET,Key=f"sessions/{token}.json")
+        return json.loads(obj["Body"].read().decode())
+    except Exception:
+        item=uploads.get(token)
+        if item: return item
+        raise HTTPException(404,"Saved upload session not found.")
+@app.get("/api/upload/{token}/parts")
+def uploaded_parts(token: str, authorization: str | None = Header(default=None)):
+    check_auth(authorization); item=load_upload(token)
+    try:
+        response=s3.list_parts(Bucket=BUCKET,Key=item["key"],UploadId=item["upload_id"])
+        parts=[{"PartNumber":p["PartNumber"],"ETag":p["ETag"]} for p in response.get("Parts",[])]
+        return {"parts":parts,"key":item["key"],"size":item["size"],"filename":item["filename"]}
+    except Exception as exc: raise HTTPException(400,f"Could not inspect saved upload: {str(exc)[:300]}")
 @app.post("/api/upload/{token}/part-url")
 def part_url(token: str, part_number: int, authorization: str | None = Header(default=None)):
-    check_auth(authorization); item=uploads.get(token)
-    if not item or not 1<=part_number<=10000: raise HTTPException(404,"Upload session not found.")
+    check_auth(authorization); item=load_upload(token)
+    if not 1<=part_number<=10000: raise HTTPException(400,"Invalid chunk number.")
     url=s3.generate_presigned_url("upload_part",Params={"Bucket":BUCKET,"Key":item["key"],"UploadId":item["upload_id"],"PartNumber":part_number},ExpiresIn=3600)
     return {"url":url}
 @app.post("/api/upload/{token}/complete")
 def complete_upload(token: str, body: CompleteUpload, authorization: str | None = Header(default=None)):
-    check_auth(authorization); item=uploads.get(token)
-    if not item or body.upload_id!=item["upload_id"] or body.key!=item["key"]: raise HTTPException(404,"Upload session not found.")
+    item=load_upload(token)
+    if body.upload_id!=item["upload_id"] or body.key!=item["key"]: raise HTTPException(404,"Upload session mismatch.")
     try:
+        listed=s3.list_parts(Bucket=BUCKET,Key=item["key"],UploadId=item["upload_id"])
+        actual=sorted([{"PartNumber":p["PartNumber"],"ETag":p["ETag"]} for p in listed.get("Parts",[])],key=lambda p:p["PartNumber"])
+        if not actual: raise HTTPException(400,"No uploaded chunks were found.")
         ordered=sorted(body.parts,key=lambda p:p["PartNumber"])
+        if ordered != actual: ordered=actual
         s3.complete_multipart_upload(Bucket=BUCKET,Key=item["key"],UploadId=item["upload_id"],MultipartUpload={"Parts":ordered})
         uploaded_size = s3.head_object(Bucket=BUCKET, Key=item["key"])["ContentLength"]
         if uploaded_size != item["size"]:
             s3.delete_object(Bucket=BUCKET, Key=item["key"])
-            raise HTTPException(400, f"Upload size mismatch: expected {item['size']:,} bytes but storage contains {uploaded_size:,} bytes. Please retry the upload.")
+            raise HTTPException(400, f"Upload size mismatch: expected {item['size']:,} bytes but storage contains {uploaded_size:,} bytes.")
     except HTTPException:
         raise
     except Exception as exc: raise HTTPException(400,f"Could not finish upload: {str(exc)[:400]}")
-    uploads.pop(token,None); return {"key":item["key"]}
+    uploads.pop(token,None)
+    try: s3.delete_object(Bucket=BUCKET,Key=f"sessions/{token}.json")
+    except Exception: pass
+    return {"key":item["key"]}
 @app.post("/api/process")
 def process(body: StartJob, authorization: str | None = Header(default=None)):
     check_auth(authorization)
@@ -179,7 +204,12 @@ def delete_job(job_id: str, authorization: str | None = Header(default=None)):
     return {"deleted":True}
 @app.delete("/api/uploads/{token}")
 def cancel_upload(token: str, authorization: str | None = Header(default=None)):
-    check_auth(authorization); item=uploads.pop(token,None)
-    if item: s3.abort_multipart_upload(Bucket=BUCKET,Key=item["key"],UploadId=item["upload_id"])
+    check_auth(authorization)
+    try:
+        item=load_upload(token)
+        s3.abort_multipart_upload(Bucket=BUCKET,Key=item["key"],UploadId=item["upload_id"])
+        s3.delete_object(Bucket=BUCKET,Key=f"sessions/{token}.json")
+        uploads.pop(token,None)
+    except HTTPException: pass
     return {"cancelled":True}
 app.mount("/",StaticFiles(directory="static",html=True),name="static")
