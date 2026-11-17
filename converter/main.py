@@ -56,11 +56,18 @@ def run_job(job_id: str, input_key: str, srt_text: str, language: str):
         input_size = s3.head_object(Bucket=BUCKET, Key=input_key)["ContentLength"]
         with lock: jobs[job_id].update(status="processing", message="Preparing the video and subtitle track…")
         input_url = s3.generate_presigned_url("get_object", Params={"Bucket": BUCKET, "Key": input_key}, ExpiresIn=43200)
+        source_probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "json", input_url], capture_output=True, text=True, timeout=300)
+        if source_probe.returncode != 0:
+            raise RuntimeError("Source video validation failed: FFprobe could not read the uploaded MP4. The original upload is preserved. " + source_probe.stderr[-1200:])
+        import json
+        source_types = [item.get("codec_type") for item in json.loads(source_probe.stdout).get("streams", [])]
+        if "video" not in source_types:
+            raise RuntimeError(f"Source video validation failed: no video stream was found in the uploaded file (streams: {source_types}). The original upload is preserved.")
         with tempfile.TemporaryDirectory() as td:
             srt_path = Path(td) / "subtitles.srt"
             srt_path.write_text(srt_text.lstrip("\ufeff"), encoding="utf-8")
             cmd = ["ffmpeg","-hide_banner","-loglevel","error","-i",input_url,"-i",str(srt_path),
-                   "-map","0:v?","-map","0:a?","-map","1:0","-c","copy","-c:s","mov_text",
+                   "-map","0:v:0","-map","0:a?","-map","1:0","-c","copy","-c:s","mov_text",
                    "-metadata:s:s:0",f"language={language}","-movflags","+frag_keyframe+empty_moov+default_base_moof","-f","mp4","pipe:1"]
             with tempfile.TemporaryFile() as errfile:
                 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errfile, bufsize=0)
@@ -136,6 +143,12 @@ def complete_upload(token: str, body: CompleteUpload, authorization: str | None 
     try:
         ordered=sorted(body.parts,key=lambda p:p["PartNumber"])
         s3.complete_multipart_upload(Bucket=BUCKET,Key=item["key"],UploadId=item["upload_id"],MultipartUpload={"Parts":ordered})
+        uploaded_size = s3.head_object(Bucket=BUCKET, Key=item["key"])["ContentLength"]
+        if uploaded_size != item["size"]:
+            s3.delete_object(Bucket=BUCKET, Key=item["key"])
+            raise HTTPException(400, f"Upload size mismatch: expected {item['size']:,} bytes but storage contains {uploaded_size:,} bytes. Please retry the upload.")
+    except HTTPException:
+        raise
     except Exception as exc: raise HTTPException(400,f"Could not finish upload: {str(exc)[:400]}")
     uploads.pop(token,None); return {"key":item["key"]}
 @app.post("/api/process")
