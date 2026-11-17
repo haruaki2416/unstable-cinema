@@ -94,12 +94,13 @@ function attachVideo(file){
  captionOverlay.style.display="none";
  if(videoUrl){URL.revokeObjectURL(videoUrl);videoUrl=null}
  video.removeAttribute('src');
- video.preload='none';
+ video.preload='metadata';
  videoUrl=URL.createObjectURL(file);
  video.src=videoUrl;
- // Do not call load() here: on iPad Safari, defer media initialisation
- // until the user presses Play in the native controls.
- videoInfo='Video selected ('+(file.size/1024/1024/1024).toFixed(2)+' GB) • press Play';updateStatus();
+ // Explicitly initialise the media element so Safari can read the MP4 metadata.
+ // metadata preload avoids asking Safari to fetch the entire multi-GB file up front.
+ video.load();
+ videoInfo='Opening video metadata ('+(file.size/1024/1024/1024).toFixed(2)+' GB)…';updateStatus();
 }
 videoInput.addEventListener('change',()=>{
  const file=videoInput.files&&videoInput.files[0];if(!file)return;
