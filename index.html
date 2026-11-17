@@ -47,7 +47,7 @@ select{padding:8px 9px}
 <label class="pick"><strong>💬 Choose subtitles</strong><small>Select your synced .srt file</small><input id="subtitleFile" type="file" accept=".srt,.txt,application/x-subrip,text/plain"></label>
 </div>
 <div class="stage" id="stage">
-<video id="video" controls playsinline preload="metadata"></video>
+<video id="video" controls playsinline webkit-playsinline preload="none"></video>
 </div>
 <div class="controls">
 <div class="status" id="status" aria-live="polite">Waiting for your files…</div>
@@ -103,8 +103,18 @@ function installNativeSubtitles(){
  subtitleTrack.addEventListener('load',showTrack);showTrack();setTimeout(showTrack,250);
 }
 function attachVideo(file){
- if(videoUrl)URL.revokeObjectURL(videoUrl);
- videoUrl=URL.createObjectURL(file);video.pause();video.removeAttribute('src');video.src=videoUrl;video.preload='metadata';video.load();installNativeSubtitles();
+ // Keep iPad Safari from eagerly probing a huge local file on selection.
+ video.pause();
+ if(subtitleTrack){subtitleTrack.remove();subtitleTrack=null}
+ if(subtitleUrl){URL.revokeObjectURL(subtitleUrl);subtitleUrl=null}
+ if(videoUrl){URL.revokeObjectURL(videoUrl);videoUrl=null}
+ video.removeAttribute('src');
+ video.preload='none';
+ videoUrl=URL.createObjectURL(file);
+ video.src=videoUrl;
+ // Do not call load() here: on iPad Safari, defer media initialisation
+ // until the user presses Play in the native controls.
+ setStatus('Video selected • '+(file.size/1024/1024/1024).toFixed(2)+' GB • press Play to start.');
 }
 videoInput.addEventListener('change',()=>{
  const file=videoInput.files&&videoInput.files[0];if(!file)return;
@@ -118,7 +128,13 @@ srtInput.addEventListener('change',async()=>{
   setStatus(cues.length+' subtitle cues loaded. Nothing was saved to browser storage.');
  }catch(e){cues=[];installNativeSubtitles();setStatus('Could not read that subtitle file. Please choose the .srt again.')}
 });
-video.addEventListener('loadedmetadata',()=>{setStatus('Video loaded • '+Math.round(video.duration/60)+' min'+(cues.length?' • subtitles loaded':' • choose your subtitle file')+'.')});
+video.addEventListener('loadedmetadata',()=>{const d=video.duration;const duration=Number.isFinite(d)?(Math.floor(d/3600)+'h '+Math.floor(d%3600/60)+'m'): 'duration unknown';setStatus('Video ready • '+duration+(cues.length?' • subtitles loaded':' • choose your subtitle file')+'.')});
+video.addEventListener('loadstart',()=>setStatus('Safari is opening the video…'));
+video.addEventListener('waiting',()=>setStatus('Buffering video…'));
+video.addEventListener('playing',()=>setStatus('Playing • '+(Number.isFinite(video.duration)?Math.floor(video.duration/60)+' min total':'')));
+video.addEventListener('stalled',()=>setStatus('Safari paused while reading the file. Try pressing Play again.'));
+video.addEventListener('abort',()=>setStatus('Video loading was interrupted by Safari.'));
+video.addEventListener('emptied',()=>{});
 video.addEventListener('error',()=>setStatus('This video format may not be supported by Safari. Try an MP4 encoded with H.264 video and AAC audio.'));
 document.getElementById('size').addEventListener('change',e=>{let style=document.getElementById('cueStyle');if(!style){style=document.createElement('style');style.id='cueStyle';document.head.appendChild(style)}style.textContent='video::cue { font-size: '+e.target.value+'px; }'});
 document.getElementById('speed').addEventListener('change',e=>video.playbackRate=Number(e.target.value));
