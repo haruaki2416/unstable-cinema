@@ -22,6 +22,10 @@ h1{font-size:21px;letter-spacing:-.5px;margin:0}
 input[type=file]{width:100%;font-size:12px;color:var(--muted)}
 input::file-selector-button{border:0;border-radius:8px;padding:9px 11px;background:#292e40;color:var(--text);font-weight:650;margin-right:8px}
 .stage{position:relative;background:#000;border-radius:15px;overflow:hidden;aspect-ratio:16/9;display:grid;place-items:center}
+.captionOverlay{position:absolute;left:4%;right:4%;bottom:5%;z-index:3;display:none;flex-direction:column;align-items:center;gap:3px;text-align:center;pointer-events:none;text-shadow:0 2px 5px #000,0 0 9px #000;background:linear-gradient(transparent,#0005);padding:12px 8px 5px}
+.captionLine{max-width:100%;white-space:pre-wrap;color:#fff;font-weight:600;line-height:1.25;font-size:25px}
+.captionLine.next{opacity:.9}
+@media(max-width:600px){.captionLine{font-size:20px}}
 video{width:100%;height:100%;object-fit:contain;background:#000}
 .controls{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding-top:15px}
 .status{color:var(--muted);font-size:12px;min-height:18px}
@@ -48,6 +52,7 @@ select{padding:8px 9px}
 </div>
 <div class="stage" id="stage">
 <video id="video" controls playsinline webkit-playsinline preload="none"></video>
+<div class="captionOverlay" id="captionOverlay" aria-live="off"><div class="captionLine current" id="captionCurrent"></div><div class="captionLine next" id="captionNext"></div></div>
 </div>
 <div class="controls">
 <div class="status" id="status" aria-live="polite">Waiting for your files…</div>
@@ -62,7 +67,8 @@ select{padding:8px 9px}
 </main>
 <script>
 const video=document.getElementById('video'), videoInput=document.getElementById('videoFile'), srtInput=document.getElementById('subtitleFile'), statusEl=document.getElementById('status'), stage=document.getElementById('stage');
-let cues=[],videoUrl=null,subtitleUrl=null,subtitleTrack=null;
+let cues=[],videoUrl=null,videoInfo="No video selected",subtitleInfo="No subtitles loaded";
+const captionOverlay=document.getElementById("captionOverlay"),captionCurrent=document.getElementById("captionCurrent"),captionNext=document.getElementById("captionNext");
 function setStatus(s){statusEl.textContent=s}
 function parseTime(t){const m=t.trim().match(/^(\d{1,3}):(\d{2}):(\d{2})[,.](\d{1,3})$/);return m?Number(m[1])*3600+Number(m[2])*60+Number(m[3])+Number(m[4].padEnd(3,'0').slice(0,3))/1000:NaN}
 function parseSrt(text){
@@ -71,42 +77,21 @@ function parseSrt(text){
  for(const block of blocks){const lines=block.split('\n');const ti=lines.findIndex(x=>x.includes('-->'));if(ti<0)continue;const parts=lines[ti].split('-->');const start=parseTime(parts[0]);const end=parseTime(parts[1].trim().split(/\s+/)[0]);const body=lines.slice(ti+1).join('\n').trim();if(Number.isFinite(start)&&Number.isFinite(end)&&body)parsed.push({start,end,text:body.replace(/<[^>]*>/g,'')});}
  return parsed.sort((a,b)=>a.start-b.start);
 }
-function toVttTime(seconds){
- const ms=Math.round(seconds*1000),h=Math.floor(ms/3600000),m=Math.floor(ms%3600000/60000),s=Math.floor(ms%60000/1000),x=ms%1000;
- return String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0')+'.'+String(x).padStart(3,'0');
+function updateStatus(){setStatus(videoInfo+(subtitleInfo?' • '+subtitleInfo:''))}
+function updateCaptions(){
+ if(!cues.length||!Number.isFinite(video.currentTime)){captionOverlay.style.display='none';return}
+ const t=video.currentTime;let lo=0,hi=cues.length-1,found=-1;
+ while(lo<=hi){const mid=(lo+hi)>>1;if(cues[mid].start<=t){found=mid;lo=mid+1}else hi=mid-1}
+ if(found<0||t>=cues[found].end){captionOverlay.style.display='none';return}
+ captionCurrent.textContent=cues[found].text.replace(/\\s*\\n\\s*/g,' ').trim();
+ const next=cues[found+1]?cues[found+1].text.replace(/\\s*\\n\\s*/g,' ').trim():'';
+ captionNext.textContent=next;captionNext.style.display=next?'block':'none';captionOverlay.style.display='flex';
 }
-function makeTwoLineCues(source){
- const paired=[];
- for(let i=0;i<source.length;i++){
-  const current=source[i],next=source[i+1];
-  const currentLine=current.text.replace(/\s*\n\s*/g,' ').trim();
-  const nextLine=next?next.text.replace(/\s*\n\s*/g,' ').trim():'';
-  const gap=next?next.start-current.end:Infinity;
-  if(next&&gap<=1.25){
-   paired.push({start:current.start,end:current.end,text:currentLine+'\n'+nextLine});
-  }else{
-   paired.push(current);
-  }
- }
- return paired;
-}
-function installNativeSubtitles(){
- if(subtitleTrack){subtitleTrack.remove();subtitleTrack=null}
- if(subtitleUrl){URL.revokeObjectURL(subtitleUrl);subtitleUrl=null}
- if(!cues.length)return;
- const displayCues=makeTwoLineCues(cues);
- const vtt='WEBVTT\n\n'+displayCues.map(c=>toVttTime(c.start)+' --> '+toVttTime(c.end)+'\n'+c.text).join('\n\n');
- subtitleUrl=URL.createObjectURL(new Blob([vtt],{type:'text/vtt'}));
- subtitleTrack=document.createElement('track');subtitleTrack.kind='subtitles';subtitleTrack.label='English';subtitleTrack.srclang='en';subtitleTrack.default=true;subtitleTrack.src=subtitleUrl;
- video.appendChild(subtitleTrack);
- const showTrack=()=>{try{subtitleTrack.track.mode='showing'}catch(e){}};
- subtitleTrack.addEventListener('load',showTrack);showTrack();setTimeout(showTrack,250);
-}
+function installNativeSubtitles(){updateCaptions()}
 function attachVideo(file){
  // Keep iPad Safari from eagerly probing a huge local file on selection.
  video.pause();
- if(subtitleTrack){subtitleTrack.remove();subtitleTrack=null}
- if(subtitleUrl){URL.revokeObjectURL(subtitleUrl);subtitleUrl=null}
+ captionOverlay.style.display="none";
  if(videoUrl){URL.revokeObjectURL(videoUrl);videoUrl=null}
  video.removeAttribute('src');
  video.preload='none';
@@ -114,29 +99,30 @@ function attachVideo(file){
  video.src=videoUrl;
  // Do not call load() here: on iPad Safari, defer media initialisation
  // until the user presses Play in the native controls.
- setStatus('Video selected • '+(file.size/1024/1024/1024).toFixed(2)+' GB • press Play to start.');
+ videoInfo='Video selected ('+(file.size/1024/1024/1024).toFixed(2)+' GB) • press Play';updateStatus();
 }
 videoInput.addEventListener('change',()=>{
  const file=videoInput.files&&videoInput.files[0];if(!file)return;
  attachVideo(file);
- setStatus('Video selected. Playing directly from Files; no browser copy is created.');
+ updateStatus();
 });
 srtInput.addEventListener('change',async()=>{
  const file=srtInput.files&&srtInput.files[0];if(!file)return;
  try{
   cues=parseSrt(await file.text());installNativeSubtitles();
-  setStatus(cues.length+' subtitle cues loaded. Nothing was saved to browser storage.');
- }catch(e){cues=[];installNativeSubtitles();setStatus('Could not read that subtitle file. Please choose the .srt again.')}
+  subtitleInfo=cues.length+' subtitle cues loaded';updateStatus();
+ }catch(e){cues=[];installNativeSubtitles();subtitleInfo='Could not read subtitles';updateStatus()}
 });
-video.addEventListener('loadedmetadata',()=>{const d=video.duration;const duration=Number.isFinite(d)?(Math.floor(d/3600)+'h '+Math.floor(d%3600/60)+'m'): 'duration unknown';setStatus('Video ready • '+duration+(cues.length?' • subtitles loaded':' • choose your subtitle file')+'.')});
-video.addEventListener('loadstart',()=>setStatus('Safari is opening the video…'));
-video.addEventListener('waiting',()=>setStatus('Buffering video…'));
-video.addEventListener('playing',()=>setStatus('Playing • '+(Number.isFinite(video.duration)?Math.floor(video.duration/60)+' min total':'')));
-video.addEventListener('stalled',()=>setStatus('Safari paused while reading the file. Try pressing Play again.'));
-video.addEventListener('abort',()=>setStatus('Video loading was interrupted by Safari.'));
+video.addEventListener('loadedmetadata',()=>{const d=video.duration;const duration=Number.isFinite(d)?(Math.floor(d/3600)+'h '+Math.floor(d%3600/60)+'m'): 'duration unknown';videoInfo='Video duration: '+duration;updateStatus()});
+video.addEventListener('loadstart',()=>{videoInfo='Safari is opening the video…';updateStatus()});
+video.addEventListener('waiting',()=>{videoInfo='Buffering video…';updateStatus()});
+video.addEventListener('playing',()=>{videoInfo='Playing • '+(Number.isFinite(video.duration)?Math.floor(video.duration/60)+' min total':'duration unknown');updateStatus()});
+video.addEventListener('stalled',()=>{videoInfo='Safari paused while reading the file';updateStatus()});
+video.addEventListener('abort',()=>{videoInfo='Video loading was interrupted by Safari';updateStatus()});
 video.addEventListener('emptied',()=>{});
-video.addEventListener('error',()=>setStatus('This video format may not be supported by Safari. Try an MP4 encoded with H.264 video and AAC audio.'));
-document.getElementById('size').addEventListener('change',e=>{let style=document.getElementById('cueStyle');if(!style){style=document.createElement('style');style.id='cueStyle';document.head.appendChild(style)}style.textContent='video::cue { font-size: '+e.target.value+'px; }'});
+video.addEventListener('timeupdate',updateCaptions);video.addEventListener('seeked',updateCaptions);
+video.addEventListener('error',()=>{videoInfo='Safari could not decode this video';updateStatus()});
+document.getElementById('size').addEventListener('change',e=>{let style=document.getElementById('cueStyle');if(!style){style=document.createElement('style');style.id='cueStyle';document.head.appendChild(style)}style.textContent='.captionLine { font-size: '+e.target.value+'px; }'});
 document.getElementById('speed').addEventListener('change',e=>video.playbackRate=Number(e.target.value));
 document.getElementById('fullscreen').addEventListener('click',async()=>{
  try{if(document.fullscreenElement){await document.exitFullscreen()}else if(stage.requestFullscreen){await stage.requestFullscreen()}else if(video.webkitEnterFullscreen){video.webkitEnterFullscreen()}else{setStatus('Fullscreen is not available in this browser.');}}
