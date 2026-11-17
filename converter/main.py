@@ -50,7 +50,10 @@ def configure_bucket_cors():
 def run_job(job_id: str, input_key: str, srt_text: str, language: str):
     output_key = f"output/{job_id}.mp4"
     upload_id = None
+    input_size = 0
+    output_created = False
     try:
+        input_size = s3.head_object(Bucket=BUCKET, Key=input_key)["ContentLength"]
         with lock: jobs[job_id].update(status="processing", message="Preparing the video and subtitle track…")
         input_url = s3.generate_presigned_url("get_object", Params={"Bucket": BUCKET, "Key": input_key}, ExpiresIn=43200)
         with tempfile.TemporaryDirectory() as td:
@@ -82,16 +85,30 @@ def run_job(job_id: str, input_key: str, srt_text: str, language: str):
                     parts.append({"PartNumber":part_no,"ETag":result["ETag"]})
                 s3.complete_multipart_upload(Bucket=BUCKET,Key=output_key,UploadId=upload_id,MultipartUpload={"Parts":parts})
                 upload_id = None
+                output_created = True
+        output_info = s3.head_object(Bucket=BUCKET, Key=output_key)
+        output_size = output_info["ContentLength"]
+        if output_size < max(5 * 1024 * 1024, int(input_size * 0.80)):
+            raise RuntimeError(f"Output validation failed: generated MP4 is only {output_size:,} bytes for a {input_size:,}-byte source. Original upload has been preserved; no download should be offered.")
+        output_url = s3.generate_presigned_url("get_object", Params={"Bucket": BUCKET, "Key": output_key}, ExpiresIn=3600)
+        probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "json", output_url], capture_output=True, text=True, timeout=180)
+        if probe.returncode != 0:
+            raise RuntimeError("Output validation failed: ffprobe could not read the generated MP4. Original upload has been preserved. " + probe.stderr[-1200:])
+        import json
+        stream_types = [item.get("codec_type") for item in json.loads(probe.stdout).get("streams", [])]
+        if "video" not in stream_types or "subtitle" not in stream_types:
+            raise RuntimeError(f"Output validation failed: expected video and subtitle streams, found {stream_types}. Original upload has been preserved.")
         try: s3.delete_object(Bucket=BUCKET,Key=input_key)
         except Exception: pass
-        with lock: jobs[job_id].update(status="complete",message="Done. The MP4 now contains a selectable subtitle track.",output_key=output_key)
+        with lock: jobs[job_id].update(status="complete",message=f"Validated MP4 ready ({output_size:,} bytes) with video and selectable subtitle streams.",output_key=output_key,output_size=output_size)
     except Exception as exc:
         if upload_id:
             try: s3.abort_multipart_upload(Bucket=BUCKET,Key=output_key,UploadId=upload_id)
             except Exception: pass
-        try: s3.delete_object(Bucket=BUCKET,Key=input_key)
-        except Exception: pass
-        with lock: jobs[job_id].update(status="failed",message=str(exc)[:1800])
+        if output_created:
+            try: s3.delete_object(Bucket=BUCKET,Key=output_key)
+            except Exception: pass
+        with lock: jobs[job_id].update(status="failed",message=str(exc)[:1800],input_preserved=True)
 
 @app.get("/health")
 def health(): return {"ok":True}
