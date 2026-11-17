@@ -39,6 +39,9 @@ class StartJob(BaseModel):
     key: str
     srt_text: str
     subtitle_language: str = "und"
+class RetryLatest(BaseModel):
+    srt_text: str
+    subtitle_language: str = "und"
 
 @app.on_event("startup")
 def configure_bucket_cors():
@@ -182,6 +185,24 @@ def process(body: StartJob, authorization: str | None = Header(default=None)):
     with lock: jobs[job_id]={"status":"queued","message":"Queued for processing."}
     threading.Thread(target=run_job,args=(job_id,body.key,body.srt_text,body.subtitle_language),daemon=True).start()
     return {"job_id":job_id}
+@app.post("/api/retry-latest")
+def retry_latest(body: RetryLatest, authorization: str | None = Header(default=None)):
+    check_auth(authorization)
+    if len(body.srt_text)>15_000_000 or "-->" not in body.srt_text:
+        raise HTTPException(400,"That does not look like a valid SRT subtitle file.")
+    try:
+        response=s3.list_objects_v2(Bucket=BUCKET,Prefix="input/")
+        candidates=[o for o in response.get("Contents",[]) if o["Key"].lower().endswith(".mp4")]
+        if not candidates: raise HTTPException(404,"No saved MP4 upload was found in input/.")
+        latest=max(candidates,key=lambda o:o["LastModified"])
+        key=latest["Key"]
+        s3.head_object(Bucket=BUCKET,Key=key)
+    except HTTPException: raise
+    except Exception as exc: raise HTTPException(500,f"Could not find saved upload: {str(exc)[:300]}")
+    job_id=str(uuid.uuid4())
+    with lock: jobs[job_id]={"status":"queued","message":f"Retrying saved upload: {Path(key).name}"}
+    threading.Thread(target=run_job,args=(job_id,key,body.srt_text,body.subtitle_language),daemon=True).start()
+    return {"job_id":job_id,"source":Path(key).name}
 @app.get("/api/jobs/{job_id}")
 def job_status(job_id: str, authorization: str | None = Header(default=None)):
     check_auth(authorization)
