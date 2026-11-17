@@ -56,13 +56,9 @@ def run_job(job_id: str, input_key: str, srt_text: str, language: str):
         input_size = s3.head_object(Bucket=BUCKET, Key=input_key)["ContentLength"]
         with lock: jobs[job_id].update(status="processing", message="Preparing the video and subtitle track…")
         input_url = s3.generate_presigned_url("get_object", Params={"Bucket": BUCKET, "Key": input_key}, ExpiresIn=43200)
-        source_probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "json", input_url], capture_output=True, text=True, timeout=300)
-        if source_probe.returncode != 0:
-            raise RuntimeError("Source video validation failed: FFprobe could not read the uploaded MP4. The original upload is preserved. " + source_probe.stderr[-1200:])
-        import json
-        source_types = [item.get("codec_type") for item in json.loads(source_probe.stdout).get("streams", [])]
-        if "video" not in source_types:
-            raise RuntimeError(f"Source video validation failed: no video stream was found in the uploaded file (streams: {source_types}). The original upload is preserved.")
+        # Do not pre-scan the remote 8+ GB source with ffprobe: on large objects
+        # this can take minutes and time out before muxing even begins. FFmpeg's
+        # required -map 0:v:0 below validates that a video stream is present.
         with tempfile.TemporaryDirectory() as td:
             srt_path = Path(td) / "subtitles.srt"
             srt_path.write_text(srt_text.lstrip("\ufeff"), encoding="utf-8")
@@ -98,7 +94,7 @@ def run_job(job_id: str, input_key: str, srt_text: str, language: str):
         if output_size < max(5 * 1024 * 1024, int(input_size * 0.80)):
             raise RuntimeError(f"Output validation failed: generated MP4 is only {output_size:,} bytes for a {input_size:,}-byte source. Original upload has been preserved; no download should be offered.")
         output_url = s3.generate_presigned_url("get_object", Params={"Bucket": BUCKET, "Key": output_key}, ExpiresIn=3600)
-        probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "json", output_url], capture_output=True, text=True, timeout=180)
+        probe = subprocess.run(["ffprobe", "-v", "error", "-probesize", "5000000", "-analyzeduration", "5000000", "-show_entries", "stream=codec_type", "-of", "json", output_url], capture_output=True, text=True, timeout=900)
         if probe.returncode != 0:
             raise RuntimeError("Output validation failed: ffprobe could not read the generated MP4. Original upload has been preserved. " + probe.stderr[-1200:])
         import json
