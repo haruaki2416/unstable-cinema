@@ -57,7 +57,7 @@ def run_job(job_id: str, input_key: str, srt_text: str, language: str):
             srt_path = Path(td) / "subtitles.srt"
             srt_path.write_text(srt_text.lstrip("\ufeff"), encoding="utf-8")
             cmd = ["ffmpeg","-hide_banner","-loglevel","error","-i",input_url,"-i",str(srt_path),
-                   "-map","0","-map","1:0","-c","copy","-c:s","mov_text",
+                   "-map","0:v?","-map","0:a?","-map","1:0","-c","copy","-c:s","mov_text",
                    "-metadata:s:s:0",f"language={language}","-movflags","+frag_keyframe+empty_moov+default_base_moof","-f","mp4","pipe:1"]
             with tempfile.TemporaryFile() as errfile:
                 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errfile, bufsize=0)
@@ -89,6 +89,8 @@ def run_job(job_id: str, input_key: str, srt_text: str, language: str):
         if upload_id:
             try: s3.abort_multipart_upload(Bucket=BUCKET,Key=output_key,UploadId=upload_id)
             except Exception: pass
+        try: s3.delete_object(Bucket=BUCKET,Key=input_key)
+        except Exception: pass
         with lock: jobs[job_id].update(status="failed",message=str(exc)[:1800])
 
 @app.get("/health")
