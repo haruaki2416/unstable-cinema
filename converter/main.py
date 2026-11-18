@@ -104,9 +104,9 @@ def run_job(job_id: str, input_key: str, srt_text: str, language: str):
         stream_types = [item.get("codec_type") for item in json.loads(probe.stdout).get("streams", [])]
         if "video" not in stream_types or "subtitle" not in stream_types:
             raise RuntimeError(f"Output validation failed: expected video and subtitle streams, found {stream_types}. Original upload has been preserved.")
-        try: s3.delete_object(Bucket=BUCKET,Key=input_key)
-        except Exception: pass
-        with lock: jobs[job_id].update(status="complete",message=f"Validated MP4 ready ({output_size:,} bytes) with video and selectable subtitle streams.",output_key=output_key,output_size=output_size)
+        # Keep the original upload in input/ so the user can retry conversion
+        # with another subtitle file without uploading a multi-GB video again.
+        with lock: jobs[job_id].update(status="complete",message=f"Validated MP4 ready ({output_size:,} bytes) with video and selectable subtitle streams. Original upload preserved for retries.",output_key=output_key,output_size=output_size)
     except Exception as exc:
         if upload_id:
             try: s3.abort_multipart_upload(Bucket=BUCKET,Key=output_key,UploadId=upload_id)
