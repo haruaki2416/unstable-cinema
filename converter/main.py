@@ -59,15 +59,34 @@ def run_job(job_id: str, input_key: str, srt_text: str, language: str):
     try:
         input_size = s3.head_object(Bucket=BUCKET, Key=input_key)["ContentLength"]
         with lock: jobs[job_id].update(status="processing", message="Preparing the video and subtitle track…")
-        input_url = s3.generate_presigned_url("get_object", Params={"Bucket": BUCKET, "Key": input_key}, ExpiresIn=43200)
-        # Do not pre-scan the remote 8+ GB source with ffprobe: on large objects
-        # this can take minutes and time out before muxing even begins. FFmpeg's
-        # required -map 0:v:0 below validates that a video stream is present.
-        with tempfile.TemporaryDirectory() as td:
+        # Do not give FFmpeg a presigned object-store URL. Some S3-compatible
+        # endpoints return 404 for FFmpeg's later HTTP range requests, causing
+        # it to mux only the first few packets. Download through the authenticated
+        # S3 SDK to a temporary local file first; this also gives FFmpeg a seekable
+        # MP4 input even when its moov atom is at the end of the file.
+        with tempfile.TemporaryDirectory(prefix="unstable-mux-") as td:
+            source_path = Path(td) / "source.mp4"
             srt_path = Path(td) / "subtitles.srt"
+            with lock:
+                jobs[job_id].update(status="processing", message="Downloading original from storage for reliable muxing…")
+            source_obj = s3.get_object(Bucket=BUCKET, Key=input_key)
+            downloaded = 0
+            with source_path.open("wb") as source_file:
+                body = source_obj["Body"]
+                while True:
+                    block = body.read(16 * 1024 * 1024)
+                    if not block:
+                        break
+                    source_file.write(block)
+                    downloaded += len(block)
+                    with lock:
+                        jobs[job_id]["message"] = f"Preparing source… {downloaded:,} / {input_size:,} bytes"
+                body.close()
+            if downloaded != input_size:
+                raise RuntimeError(f"Source download incomplete: received {downloaded:,} of {input_size:,} bytes. Original upload remains preserved.")
             srt_path.write_text(srt_text.lstrip("\ufeff"), encoding="utf-8")
-            cmd = ["ffmpeg","-hide_banner","-loglevel","warning","-reconnect","1","-reconnect_streamed","1","-reconnect_delay_max","30","-rw_timeout","300000000","-i",input_url,"-i",str(srt_path),
-                   "-map","0:v:0","-map","0:a?","-map","1:0","-c","copy","-c:s","mov_text",
+            cmd = ["ffmpeg","-hide_banner","-loglevel","warning","-probesize","100M","-analyzeduration","100M","-i",str(source_path),"-i",str(srt_path),
+                   "-map","0:v:0","-map","0:a?","-map","1:0","-c:v","copy","-c:a","copy","-c:s","mov_text",
                    "-metadata:s:s:0",f"language={language}","-movflags","+frag_keyframe+empty_moov+default_base_moof","-f","mp4","pipe:1"]
             with tempfile.TemporaryFile() as errfile:
                 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errfile, bufsize=0)
