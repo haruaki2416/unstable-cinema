@@ -55,6 +55,7 @@ def run_job(job_id: str, input_key: str, srt_text: str, language: str):
     upload_id = None
     input_size = 0
     output_created = False
+    error_text = ""
     try:
         input_size = s3.head_object(Bucket=BUCKET, Key=input_key)["ContentLength"]
         with lock: jobs[job_id].update(status="processing", message="Preparing the video and subtitle track…")
@@ -65,7 +66,7 @@ def run_job(job_id: str, input_key: str, srt_text: str, language: str):
         with tempfile.TemporaryDirectory() as td:
             srt_path = Path(td) / "subtitles.srt"
             srt_path.write_text(srt_text.lstrip("\ufeff"), encoding="utf-8")
-            cmd = ["ffmpeg","-hide_banner","-loglevel","error","-i",input_url,"-i",str(srt_path),
+            cmd = ["ffmpeg","-hide_banner","-loglevel","warning","-reconnect","1","-reconnect_streamed","1","-reconnect_delay_max","30","-rw_timeout","300000000","-i",input_url,"-i",str(srt_path),
                    "-map","0:v:0","-map","0:a?","-map","1:0","-c","copy","-c:s","mov_text",
                    "-metadata:s:s:0",f"language={language}","-movflags","+frag_keyframe+empty_moov+default_base_moof","-f","mp4","pipe:1"]
             with tempfile.TemporaryFile() as errfile:
@@ -95,7 +96,7 @@ def run_job(job_id: str, input_key: str, srt_text: str, language: str):
         output_info = s3.head_object(Bucket=BUCKET, Key=output_key)
         output_size = output_info["ContentLength"]
         if output_size < max(5 * 1024 * 1024, int(input_size * 0.80)):
-            raise RuntimeError(f"Output validation failed: generated MP4 is only {output_size:,} bytes for a {input_size:,}-byte source. Original upload has been preserved; no download should be offered.")
+            raise RuntimeError(f"Output validation failed: generated MP4 is only {output_size:,} bytes for a {input_size:,}-byte source. FFmpeg may have stopped reading the remote source early. FFmpeg diagnostics: {error_text[-3000:] or '(no warning or error text was emitted)'}. Original upload has been preserved; no download should be offered.")
         output_url = s3.generate_presigned_url("get_object", Params={"Bucket": BUCKET, "Key": output_key}, ExpiresIn=3600)
         probe = subprocess.run(["ffprobe", "-v", "error", "-probesize", "5000000", "-analyzeduration", "5000000", "-show_entries", "stream=codec_type", "-of", "json", output_url], capture_output=True, text=True, timeout=900)
         if probe.returncode != 0:
