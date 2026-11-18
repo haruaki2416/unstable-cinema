@@ -214,6 +214,28 @@ def process(body: StartJob, authorization: str | None = Header(default=None)):
     with lock: jobs[job_id]={"status":"queued","message":"Queued for processing."}
     threading.Thread(target=run_job,args=(job_id,body.key,body.srt_text,body.subtitle_language),daemon=True).start()
     return {"job_id":job_id}
+@app.delete("/api/saved-source")
+def delete_saved_source(authorization: str | None = Header(default=None)):
+    check_auth(authorization)
+    try:
+        saved_obj = s3.get_object(Bucket=BUCKET, Key=SAVED_UPLOAD_KEY)
+        saved = json.loads(saved_obj["Body"].read().decode())
+        key = saved.get("key")
+        if not key or not key.startswith("input/"):
+            raise HTTPException(409, "Saved source pointer is invalid; no object was deleted.")
+        try:
+            head = s3.head_object(Bucket=BUCKET, Key=key)
+            size = head.get("ContentLength", 0)
+            s3.delete_object(Bucket=BUCKET, Key=key)
+        except Exception as exc:
+            raise HTTPException(502, f"Could not delete saved source object: {str(exc)[:300]}")
+        s3.delete_object(Bucket=BUCKET, Key=SAVED_UPLOAD_KEY)
+        return {"deleted": True, "key": key, "size": size}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(404, f"No saved original was found: {str(exc)[:300]}")
+
 @app.post("/api/retry-latest")
 def retry_latest(body: RetryLatest, authorization: str | None = Header(default=None)):
     check_auth(authorization)
