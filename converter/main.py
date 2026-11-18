@@ -131,6 +131,28 @@ def init_upload(body: InitUpload, authorization: str | None = Header(default=Non
     uploads[token]=item
     s3.put_object(Bucket=BUCKET,Key=f"sessions/{token}.json",Body=json.dumps(item).encode(),ContentType="application/json")
     return {"token":token,"key":key,"upload_id":result["UploadId"],"part_size":PART_SIZE}
+SAVED_UPLOAD_KEY = "sessions/first-upload.json"
+
+def remember_first_upload(item: dict, replace: bool = False):
+    """Persist the first completed source video so retries never depend on job memory."""
+    if not replace:
+        try:
+            s3.head_object(Bucket=BUCKET, Key=SAVED_UPLOAD_KEY)
+            return
+        except Exception:
+            pass
+    saved = {
+        "key": item["key"],
+        "filename": item.get("filename", Path(item["key"]).name),
+        "size": item.get("size"),
+    }
+    s3.put_object(
+        Bucket=BUCKET,
+        Key=SAVED_UPLOAD_KEY,
+        Body=json.dumps(saved).encode(),
+        ContentType="application/json",
+    )
+
 def load_upload(token: str):
     try:
         obj=s3.get_object(Bucket=BUCKET,Key=f"sessions/{token}.json")
@@ -171,6 +193,12 @@ def complete_upload(token: str, body: CompleteUpload, authorization: str | None 
     except HTTPException:
         raise
     except Exception as exc: raise HTTPException(400,f"Could not finish upload: {str(exc)[:400]}")
+    # Keep the completed source MP4 in input/ and remember the first one
+    # permanently for retry. Successful output creation never deletes this object.
+    try:
+        remember_first_upload(item)
+    except Exception:
+        pass
     uploads.pop(token,None)
     try: s3.delete_object(Bucket=BUCKET,Key=f"sessions/{token}.json")
     except Exception: pass
@@ -191,12 +219,27 @@ def retry_latest(body: RetryLatest, authorization: str | None = Header(default=N
     if len(body.srt_text)>15_000_000 or "-->" not in body.srt_text:
         raise HTTPException(400,"That does not look like a valid SRT subtitle file.")
     try:
-        response=s3.list_objects_v2(Bucket=BUCKET,Prefix="input/")
-        candidates=[o for o in response.get("Contents",[]) if o["Key"].lower().endswith(".mp4")]
-        if not candidates: raise HTTPException(404,"No saved MP4 upload was found in input/.")
-        latest=max(candidates,key=lambda o:o["LastModified"])
-        key=latest["Key"]
-        s3.head_object(Bucket=BUCKET,Key=key)
+        # Prefer the durable first-upload pointer, so a retry keeps using the
+        # original source even after outputs or later uploads are created.
+        key = None
+        try:
+            saved_obj = s3.get_object(Bucket=BUCKET, Key=SAVED_UPLOAD_KEY)
+            saved = json.loads(saved_obj["Body"].read().decode())
+            candidate_key = saved.get("key")
+            if candidate_key:
+                s3.head_object(Bucket=BUCKET, Key=candidate_key)
+                key = candidate_key
+        except Exception:
+            key = None
+        if not key:
+            response=s3.list_objects_v2(Bucket=BUCKET,Prefix="input/")
+            candidates=[o for o in response.get("Contents",[]) if o["Key"].lower().endswith(".mp4")]
+            if not candidates: raise HTTPException(404,"No saved MP4 upload was found in input/.")
+            latest=max(candidates,key=lambda o:o["LastModified"])
+            key=latest["Key"]
+            s3.head_object(Bucket=BUCKET,Key=key)
+            # Recover the durable pointer if it was missing or stale.
+            remember_first_upload({"key":key,"filename":Path(key).name}, replace=True)
     except HTTPException: raise
     except Exception as exc: raise HTTPException(500,f"Could not find saved upload: {str(exc)[:300]}")
     job_id=str(uuid.uuid4())
