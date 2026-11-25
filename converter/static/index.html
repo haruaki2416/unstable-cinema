@@ -34,8 +34,13 @@ $("start").onclick=async()=>{
  const file=$("video").files[0],sub=$("srt").files[0];if(!file||!sub){status("Choose the video and SRT first.");return}if(!file.name.toLowerCase().endsWith(".mp4")){status("Please choose an MP4 file.");return}
  $("start").disabled=true;$("result").classList.add("hidden");let session=savedUpload();
  try{
+  if(session && (session.filename!==file.name||session.size!==file.size||session.lastModified!==file.lastModified)){
+   status("Previous incomplete upload detected. Clearing it so this new video can upload…");
+   try{await api("/api/uploads/"+session.token,{method:"DELETE"})}catch{}
+   localStorage.removeItem(RESUME_KEY);
+   session=null;
+  }
   if(session){
-   if(session.filename!==file.name||session.size!==file.size||session.lastModified!==file.lastModified)throw Error("The saved upload belongs to a different file. Re-select the exact same MP4 (same name and file) to resume.");
    status("Checking which chunks already reached storage…");
    const state=await api("/api/upload/"+session.token+"/parts");
    const done=new Map(state.parts.map(p=>[p.PartNumber,p]));
