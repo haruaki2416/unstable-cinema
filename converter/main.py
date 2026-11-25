@@ -19,6 +19,23 @@ s3 = boto3.client("s3", endpoint_url=ENDPOINT, region_name=REGION,
     config=Config(signature_version="s3v4", s3={"addressing_style": os.getenv("S3_ADDRESSING_STYLE", "path")}, connect_timeout=20, read_timeout=180, retries={"max_attempts": 3, "mode": "standard"}, tcp_keepalive=True))
 app = FastAPI(title="Unstable Converter")
 jobs: Dict[str, Dict[str, Any]] = {}
+JOB_PREFIX = "jobs/"
+
+def persist_job(job_id: str, data: dict):
+    """Persist job state so polling survives process restarts and replica changes."""
+    s3.put_object(Bucket=BUCKET, Key=f"{JOB_PREFIX}{job_id}.json",
+                  Body=json.dumps(data).encode(), ContentType="application/json")
+
+def update_job(job_id: str, **fields):
+    with lock:
+        job = jobs.setdefault(job_id, {})
+        job.update(fields)
+        snapshot = dict(job)
+    try:
+        persist_job(job_id, snapshot)
+    except Exception:
+        pass
+
 uploads: Dict[str, Dict[str, Any]] = {}
 lock = threading.Lock()
 
@@ -57,9 +74,7 @@ def run_job(job_id: str, input_key: str, srt_text: str, language: str):
     error_text = ""
 
     def stage(message: str, **fields):
-        with lock:
-            if job_id in jobs:
-                jobs[job_id].update(status="processing", message=message, **fields)
+        update_job(job_id, status="processing", message=message, **fields)
 
     try:
         stage("Checking original video in storage…")
@@ -210,14 +225,11 @@ def run_job(job_id: str, input_key: str, srt_text: str, language: str):
             if "video" not in stream_types or "subtitle" not in stream_types:
                 raise RuntimeError(f"Output validation failed: expected video and subtitle streams, found {stream_types}. Original upload has been preserved.")
 
-        with lock:
-            jobs[job_id].update(
-                status="complete",
-                stage="complete",
-                message=f"Validated MP4 ready ({output_size:,} bytes) with video and selectable subtitle streams. Original upload preserved for retries.",
-                output_key=output_key,
-                output_size=output_size
-            )
+        update_job(
+            job_id, status="complete", stage="complete",
+            message=f"Validated MP4 ready ({output_size:,} bytes) with video and selectable subtitle streams. Original upload preserved for retries.",
+            output_key=output_key, output_size=output_size
+        )
 
     except Exception as exc:
         if proc is not None and proc.poll() is None:
@@ -239,14 +251,8 @@ def run_job(job_id: str, input_key: str, srt_text: str, language: str):
             s3.delete_object(Bucket=BUCKET, Key=output_key)
         except Exception:
             pass
-        with lock:
-            if job_id in jobs:
-                jobs[job_id].update(
-                    status="failed",
-                    stage="failed",
-                    message=str(exc)[:1800],
-                    input_preserved=True
-                )
+        update_job(job_id, status="failed", stage="failed",
+                   message=str(exc)[:1800], input_preserved=True)
 
 @app.get("/health")
 def health(): return {"ok":True}
@@ -342,7 +348,7 @@ def process(body: StartJob, authorization: str | None = Header(default=None)):
     try: s3.head_object(Bucket=BUCKET,Key=body.key)
     except Exception: raise HTTPException(404,"Uploaded video was not found.")
     job_id=str(uuid.uuid4())
-    with lock: jobs[job_id]={"status":"queued","message":"Queued for processing."}
+    update_job(job_id, status="queued", message="Queued for processing.")
     threading.Thread(target=run_job,args=(job_id,body.key,body.srt_text,body.subtitle_language),daemon=True).start()
     return {"job_id":job_id}
 @app.delete("/api/saved-source")
@@ -397,7 +403,7 @@ def retry_latest(body: RetryLatest, authorization: str | None = Header(default=N
     except HTTPException: raise
     except Exception as exc: raise HTTPException(500,f"Could not find saved upload: {str(exc)[:300]}")
     job_id=str(uuid.uuid4())
-    with lock: jobs[job_id]={"status":"queued","message":f"Retrying saved upload: {Path(key).name}"}
+    update_job(job_id, status="queued", message=f"Retrying saved upload: {Path(key).name}")
     threading.Thread(target=run_job,args=(job_id,key,body.srt_text,body.subtitle_language),daemon=True).start()
     return {"job_id":job_id,"source":Path(key).name}
 @app.get("/api/jobs/{job_id}")
@@ -405,8 +411,15 @@ def job_status(job_id: str, authorization: str | None = Header(default=None)):
     check_auth(authorization)
     with lock:
         job=jobs.get(job_id)
-        if not job: raise HTTPException(404,"Job not found.")
-        result=dict(job)
+        result=dict(job) if job else None
+    if result is None:
+        try:
+            obj=s3.get_object(Bucket=BUCKET,Key=f"{JOB_PREFIX}{job_id}.json")
+            result=json.loads(obj["Body"].read().decode())
+            with lock:
+                jobs[job_id]=dict(result)
+        except Exception:
+            raise HTTPException(404,"Job not found. This job ID is not present in persistent storage.")
     if result.get("status")=="complete":
         result["download_url"]=s3.generate_presigned_url("get_object",Params={"Bucket":BUCKET,"Key":result["output_key"],"ResponseContentDisposition":'attachment; filename="unstable-converted.mp4"'},ExpiresIn=3600)
     return result
@@ -415,6 +428,8 @@ def delete_job(job_id: str, authorization: str | None = Header(default=None)):
     check_auth(authorization)
     with lock: job=jobs.pop(job_id,None)
     if job and job.get("output_key"): s3.delete_object(Bucket=BUCKET,Key=job["output_key"])
+    try: s3.delete_object(Bucket=BUCKET,Key=f"{JOB_PREFIX}{job_id}.json")
+    except Exception: pass
     return {"deleted":True}
 @app.delete("/api/uploads/{token}")
 def cancel_upload(token: str, authorization: str | None = Header(default=None)):
