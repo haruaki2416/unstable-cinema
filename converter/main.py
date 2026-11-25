@@ -1,4 +1,4 @@
-import os, uuid, threading, tempfile, subprocess, secrets, json
+import os, uuid, threading, tempfile, subprocess, secrets, json, queue
 from pathlib import Path
 from typing import Dict, Any
 import boto3
@@ -16,7 +16,7 @@ SECRET = os.environ["S3_SECRET_ACCESS_KEY"]
 PART_SIZE = 64 * 1024 * 1024
 s3 = boto3.client("s3", endpoint_url=ENDPOINT, region_name=REGION,
     aws_access_key_id=ACCESS, aws_secret_access_key=SECRET,
-    config=Config(signature_version="s3v4", s3={"addressing_style": os.getenv("S3_ADDRESSING_STYLE", "path")}))
+    config=Config(signature_version="s3v4", s3={"addressing_style": os.getenv("S3_ADDRESSING_STYLE", "path")}, connect_timeout=20, read_timeout=180, retries={"max_attempts": 3, "mode": "standard"}, tcp_keepalive=True))
 app = FastAPI(title="Unstable Converter")
 jobs: Dict[str, Dict[str, Any]] = {}
 uploads: Dict[str, Dict[str, Any]] = {}
@@ -53,88 +53,191 @@ def configure_bucket_cors():
 def run_job(job_id: str, input_key: str, srt_text: str, language: str):
     output_key = f"output/{job_id}.mp4"
     upload_id = None
-    input_size = 0
-    output_created = False
+    proc = None
     error_text = ""
+
+    def stage(message: str, **fields):
+        with lock:
+            if job_id in jobs:
+                jobs[job_id].update(status="processing", message=message, **fields)
+
     try:
+        stage("Checking original video in storage…")
         input_size = s3.head_object(Bucket=BUCKET, Key=input_key)["ContentLength"]
-        with lock: jobs[job_id].update(status="processing", message="Preparing the video and subtitle track…")
-        # Do not give FFmpeg a presigned object-store URL. Some S3-compatible
-        # endpoints return 404 for FFmpeg's later HTTP range requests, causing
-        # it to mux only the first few packets. Download through the authenticated
-        # S3 SDK to a temporary local file first; this also gives FFmpeg a seekable
-        # MP4 input even when its moov atom is at the end of the file.
+
         with tempfile.TemporaryDirectory(prefix="unstable-mux-") as td:
             source_path = Path(td) / "source.mp4"
             srt_path = Path(td) / "subtitles.srt"
-            with lock:
-                jobs[job_id].update(status="processing", message="Downloading original from storage for reliable muxing…")
+
+            stage("Downloading original from storage…", stage="download")
             source_obj = s3.get_object(Bucket=BUCKET, Key=input_key)
             downloaded = 0
             with source_path.open("wb") as source_file:
                 body = source_obj["Body"]
-                while True:
-                    block = body.read(16 * 1024 * 1024)
-                    if not block:
-                        break
-                    source_file.write(block)
-                    downloaded += len(block)
-                    with lock:
-                        jobs[job_id]["message"] = f"Preparing source… {downloaded:,} / {input_size:,} bytes"
-                body.close()
+                try:
+                    while True:
+                        block = body.read(16 * 1024 * 1024)
+                        if not block:
+                            break
+                        source_file.write(block)
+                        downloaded += len(block)
+                        stage(f"Preparing source… {downloaded:,} / {input_size:,} bytes", stage="download")
+                finally:
+                    body.close()
             if downloaded != input_size:
                 raise RuntimeError(f"Source download incomplete: received {downloaded:,} of {input_size:,} bytes. Original upload remains preserved.")
+
             srt_path.write_text(srt_text.lstrip("\ufeff"), encoding="utf-8")
-            cmd = ["ffmpeg","-hide_banner","-loglevel","warning","-probesize","100M","-analyzeduration","100M","-i",str(source_path),"-i",str(srt_path),
-                   "-map","0:v:0","-map","0:a?","-map","1:0","-c:v","copy","-c:a","copy","-c:s","mov_text",
-                   "-metadata:s:s:0",f"language={language}","-movflags","+frag_keyframe+empty_moov+default_base_moof","-f","mp4","pipe:1"]
+            cmd = [
+                "ffmpeg", "-hide_banner", "-loglevel", "warning",
+                "-probesize", "100M", "-analyzeduration", "100M",
+                "-i", str(source_path), "-i", str(srt_path),
+                "-map", "0:v:0", "-map", "0:a?", "-map", "1:0",
+                "-c:v", "copy", "-c:a", "copy", "-c:s", "mov_text",
+                "-metadata:s:s:0", f"language={language}",
+                "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+                "-f", "mp4", "pipe:1"
+            ]
+
+            stage("Starting FFmpeg and multipart output upload…", stage="mux_start")
             with tempfile.TemporaryFile() as errfile:
                 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errfile, bufsize=0)
-                created = s3.create_multipart_upload(Bucket=BUCKET, Key=output_key, ContentType="video/mp4",
-                    Metadata={"job-id":job_id})
+                created = s3.create_multipart_upload(
+                    Bucket=BUCKET, Key=output_key, ContentType="video/mp4",
+                    Metadata={"job-id": job_id}
+                )
                 upload_id = created["UploadId"]
                 parts, part_no, buffer = [], 1, bytearray()
+                output_bytes = 0
+                chunks = queue.Queue(maxsize=2)
+                end_of_stream = object()
+
+                def read_ffmpeg_stdout():
+                    try:
+                        while True:
+                            data = proc.stdout.read(8 * 1024 * 1024)
+                            if not data:
+                                break
+                            chunks.put(data)
+                    except Exception as read_error:
+                        chunks.put(read_error)
+                    finally:
+                        chunks.put(end_of_stream)
+
+                reader = threading.Thread(target=read_ffmpeg_stdout, daemon=True)
+                reader.start()
+
+                stage("Muxing video… waiting for FFmpeg output", stage="mux")
                 while True:
-                    chunk = proc.stdout.read(8 * 1024 * 1024)
-                    if not chunk: break
-                    buffer.extend(chunk)
+                    try:
+                        item = chunks.get(timeout=600)
+                    except queue.Empty:
+                        raise RuntimeError("FFmpeg produced no output for 10 minutes. The mux was stopped to avoid an endless job.")
+                    if item is end_of_stream:
+                        break
+                    if isinstance(item, Exception):
+                        raise RuntimeError(f"Could not read FFmpeg output: {item}")
+                    buffer.extend(item)
+                    output_bytes += len(item)
                     while len(buffer) >= 16 * 1024 * 1024:
-                        payload = bytes(buffer[:16 * 1024 * 1024]); del buffer[:16 * 1024 * 1024]
-                        result = s3.upload_part(Bucket=BUCKET,Key=output_key,UploadId=upload_id,PartNumber=part_no,Body=payload)
-                        parts.append({"PartNumber":part_no,"ETag":result["ETag"]}); part_no += 1
-                        with lock: jobs[job_id]["message"] = f"Muxing video… output chunk {part_no-1}"
-                code = proc.wait()
-                errfile.seek(0); error_text = errfile.read().decode("utf-8","replace")
-                if code != 0: raise RuntimeError(error_text[-2500:] or f"FFmpeg exited with code {code}")
+                        payload = bytes(buffer[:16 * 1024 * 1024])
+                        del buffer[:16 * 1024 * 1024]
+                        stage(f"Uploading muxed output part {part_no}… ({output_bytes:,} bytes generated)", stage="upload_parts")
+                        result = s3.upload_part(
+                            Bucket=BUCKET, Key=output_key, UploadId=upload_id,
+                            PartNumber=part_no, Body=payload
+                        )
+                        parts.append({"PartNumber": part_no, "ETag": result["ETag"]})
+                        part_no += 1
+
+                stage("FFmpeg finished writing output; checking exit status…", stage="ffmpeg_exit")
+                code = proc.wait(timeout=30)
+                proc.stdout.close()
+                errfile.seek(0)
+                error_text = errfile.read().decode("utf-8", "replace")
+                if code != 0:
+                    raise RuntimeError(error_text[-2500:] or f"FFmpeg exited with code {code}")
+                if not parts and not buffer:
+                    raise RuntimeError("FFmpeg completed but produced an empty MP4.")
+
                 if buffer:
-                    result = s3.upload_part(Bucket=BUCKET,Key=output_key,UploadId=upload_id,PartNumber=part_no,Body=bytes(buffer))
-                    parts.append({"PartNumber":part_no,"ETag":result["ETag"]})
-                s3.complete_multipart_upload(Bucket=BUCKET,Key=output_key,UploadId=upload_id,MultipartUpload={"Parts":parts})
+                    stage(f"Uploading final partial output part {part_no}…", stage="final_part")
+                    result = s3.upload_part(
+                        Bucket=BUCKET, Key=output_key, UploadId=upload_id,
+                        PartNumber=part_no, Body=bytes(buffer)
+                    )
+                    parts.append({"PartNumber": part_no, "ETag": result["ETag"]})
+
+                stage(f"Finalizing storage upload ({len(parts)} parts)…", stage="complete_multipart")
+                s3.complete_multipart_upload(
+                    Bucket=BUCKET, Key=output_key, UploadId=upload_id,
+                    MultipartUpload={"Parts": parts}
+                )
                 upload_id = None
-                output_created = True
-        output_info = s3.head_object(Bucket=BUCKET, Key=output_key)
-        output_size = output_info["ContentLength"]
-        if output_size < max(5 * 1024 * 1024, int(input_size * 0.80)):
-            raise RuntimeError(f"Output validation failed: generated MP4 is only {output_size:,} bytes for a {input_size:,}-byte source. FFmpeg may have stopped reading the remote source early. FFmpeg diagnostics: {error_text[-3000:] or '(no warning or error text was emitted)'}. Original upload has been preserved; no download should be offered.")
-        output_url = s3.generate_presigned_url("get_object", Params={"Bucket": BUCKET, "Key": output_key}, ExpiresIn=3600)
-        probe = subprocess.run(["ffprobe", "-v", "error", "-probesize", "5000000", "-analyzeduration", "5000000", "-show_entries", "stream=codec_type", "-of", "json", output_url], capture_output=True, text=True, timeout=900)
-        if probe.returncode != 0:
-            raise RuntimeError("Output validation failed: ffprobe could not read the generated MP4. Original upload has been preserved. " + probe.stderr[-1200:])
-        import json
-        stream_types = [item.get("codec_type") for item in json.loads(probe.stdout).get("streams", [])]
-        if "video" not in stream_types or "subtitle" not in stream_types:
-            raise RuntimeError(f"Output validation failed: expected video and subtitle streams, found {stream_types}. Original upload has been preserved.")
-        # Keep the original upload in input/ so the user can retry conversion
-        # with another subtitle file without uploading a multi-GB video again.
-        with lock: jobs[job_id].update(status="complete",message=f"Validated MP4 ready ({output_size:,} bytes) with video and selectable subtitle streams. Original upload preserved for retries.",output_key=output_key,output_size=output_size)
+
+            stage("Verifying completed MP4 in storage…", stage="verify_storage")
+            output_info = s3.head_object(Bucket=BUCKET, Key=output_key)
+            output_size = output_info["ContentLength"]
+            if output_size != output_bytes:
+                raise RuntimeError(f"Output size verification failed: FFmpeg generated {output_bytes:,} bytes but storage reports {output_size:,} bytes.")
+            if output_size < max(5 * 1024 * 1024, int(input_size * 0.80)):
+                raise RuntimeError(f"Output validation failed: generated MP4 is only {output_size:,} bytes for a {input_size:,}-byte source. FFmpeg may have stopped reading the source early. FFmpeg diagnostics: {error_text[-3000:] or '(no warning or error text was emitted)'}. Original upload has been preserved.")
+
+            stage("Checking video and selectable subtitle streams…", stage="ffprobe")
+            output_url = s3.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": BUCKET, "Key": output_key},
+                ExpiresIn=3600
+            )
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-rw_timeout", "30000000",
+                 "-probesize", "5000000", "-analyzeduration", "5000000",
+                 "-show_entries", "stream=codec_type", "-of", "json", output_url],
+                capture_output=True, text=True, timeout=300
+            )
+            if probe.returncode != 0:
+                raise RuntimeError("Output validation failed: ffprobe could not read the generated MP4. Original upload has been preserved. " + probe.stderr[-1200:])
+            stream_types = [item.get("codec_type") for item in json.loads(probe.stdout).get("streams", [])]
+            if "video" not in stream_types or "subtitle" not in stream_types:
+                raise RuntimeError(f"Output validation failed: expected video and subtitle streams, found {stream_types}. Original upload has been preserved.")
+
+        with lock:
+            jobs[job_id].update(
+                status="complete",
+                stage="complete",
+                message=f"Validated MP4 ready ({output_size:,} bytes) with video and selectable subtitle streams. Original upload preserved for retries.",
+                output_key=output_key,
+                output_size=output_size
+            )
+
     except Exception as exc:
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=10)
+            except Exception:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
         if upload_id:
-            try: s3.abort_multipart_upload(Bucket=BUCKET,Key=output_key,UploadId=upload_id)
-            except Exception: pass
-        if output_created:
-            try: s3.delete_object(Bucket=BUCKET,Key=output_key)
-            except Exception: pass
-        with lock: jobs[job_id].update(status="failed",message=str(exc)[:1800],input_preserved=True)
+            try:
+                s3.abort_multipart_upload(Bucket=BUCKET, Key=output_key, UploadId=upload_id)
+            except Exception:
+                pass
+        try:
+            s3.delete_object(Bucket=BUCKET, Key=output_key)
+        except Exception:
+            pass
+        with lock:
+            if job_id in jobs:
+                jobs[job_id].update(
+                    status="failed",
+                    stage="failed",
+                    message=str(exc)[:1800],
+                    input_preserved=True
+                )
 
 @app.get("/health")
 def health(): return {"ok":True}
