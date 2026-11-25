@@ -183,21 +183,30 @@ def run_job(job_id: str, input_key: str, srt_text: str, language: str):
             if output_size < max(5 * 1024 * 1024, int(input_size * 0.80)):
                 raise RuntimeError(f"Output validation failed: generated MP4 is only {output_size:,} bytes for a {input_size:,}-byte source. FFmpeg may have stopped reading the source early. FFmpeg diagnostics: {error_text[-3000:] or '(no warning or error text was emitted)'}. Original upload has been preserved.")
 
-            stage("Checking video and selectable subtitle streams…", stage="ffprobe")
-            output_url = s3.generate_presigned_url(
-                "get_object",
-                Params={"Bucket": BUCKET, "Key": output_key},
-                ExpiresIn=3600
+            stage("Checking MP4 stream headers…", stage="ffprobe")
+            # Probe only the beginning of the fragmented MP4. The stream
+            # declarations are in the initialization segment (empty_moov),
+            # so downloading the whole output through a presigned URL is
+            # unnecessary and can hang on large objects.
+            probe_obj = s3.get_object(
+                Bucket=BUCKET, Key=output_key, Range="bytes=0-8388607"
             )
+            try:
+                probe_bytes = probe_obj["Body"].read()
+            finally:
+                probe_obj["Body"].close()
+            if not probe_bytes:
+                raise RuntimeError("Output validation failed: storage returned an empty MP4 header. Original upload has been preserved.")
             probe = subprocess.run(
-                ["ffprobe", "-v", "error", "-rw_timeout", "30000000",
-                 "-probesize", "5000000", "-analyzeduration", "5000000",
-                 "-show_entries", "stream=codec_type", "-of", "json", output_url],
-                capture_output=True, text=True, timeout=300
+                ["ffprobe", "-v", "error", "-probesize", str(len(probe_bytes)),
+                 "-analyzeduration", "5000000", "-show_entries",
+                 "stream=codec_type,codec_name", "-of", "json", "pipe:0"],
+                input=probe_bytes, capture_output=True, timeout=30
             )
             if probe.returncode != 0:
-                raise RuntimeError("Output validation failed: ffprobe could not read the generated MP4. Original upload has been preserved. " + probe.stderr[-1200:])
-            stream_types = [item.get("codec_type") for item in json.loads(probe.stdout).get("streams", [])]
+                details = probe.stderr.decode("utf-8", "replace")[-1200:]
+                raise RuntimeError("Output validation failed: ffprobe could not read the MP4 initialization segment. Original upload has been preserved. " + details)
+            stream_types = [item.get("codec_type") for item in json.loads(probe.stdout.decode("utf-8")).get("streams", [])]
             if "video" not in stream_types or "subtitle" not in stream_types:
                 raise RuntimeError(f"Output validation failed: expected video and subtitle streams, found {stream_types}. Original upload has been preserved.")
 
